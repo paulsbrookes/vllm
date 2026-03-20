@@ -108,12 +108,12 @@ class TileGemm224<c10::BFloat16> {
 
     for (int32_t k = 0; k < k_times; ++k) {
       _tile_loadd(0, a_tile_0, a_tile_stride);
-      _tile_stream_loadd(2, b_tile_2, b_tile_stride);
-      _tile_dpbf16ps(4, 0, 2);
-      _tile_stream_loadd(3, b_tile_3, b_tile_stride);
-      _tile_dpbf16ps(5, 0, 3);
       _tile_loadd(1, a_tile_1, a_tile_stride);
+      _tile_stream_loadd(2, b_tile_2, b_tile_stride);
+      _tile_stream_loadd(3, b_tile_3, b_tile_stride);
+      _tile_dpbf16ps(4, 0, 2);
       _tile_dpbf16ps(6, 1, 2);
+      _tile_dpbf16ps(5, 0, 3);
       _tile_dpbf16ps(7, 1, 3);
 
       // update ptrs
@@ -252,14 +252,14 @@ class TileGemm122<c10::BFloat16> {
 
     for (int32_t k = 0; k < k_group_times; ++k) {
       _tile_loadd(0, a_tile_0, a_tile_stride);
-      _tile_stream_loadd(2, b_tile_2, b_stride);
-      _tile_dpbf16ps(6, 0, 2);
-      _tile_stream_loadd(3, b_tile_3, b_stride);
-      _tile_dpbf16ps(7, 0, 3);
       _tile_loadd(1, a_tile_1, a_tile_stride);
+      _tile_stream_loadd(2, b_tile_2, b_stride);
+      _tile_stream_loadd(3, b_tile_3, b_stride);
       _tile_stream_loadd(4, b_tile_4, b_stride);
-      _tile_dpbf16ps(6, 1, 4);
       _tile_stream_loadd(5, b_tile_5, b_stride);
+      _tile_dpbf16ps(6, 0, 2);
+      _tile_dpbf16ps(7, 0, 3);
+      _tile_dpbf16ps(6, 1, 4);
       _tile_dpbf16ps(7, 1, 5);
 
       // update ptrs
@@ -281,8 +281,8 @@ class TileGemm122<c10::BFloat16> {
     if (has_tail) {
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_stride);
-      _tile_dpbf16ps(6, 0, 2);
       _tile_stream_loadd(3, b_tile_3, b_stride);
+      _tile_dpbf16ps(6, 0, 2);
       _tile_dpbf16ps(7, 0, 3);
     }
 
