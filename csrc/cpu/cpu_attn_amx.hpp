@@ -56,6 +56,22 @@ class TileGemm224<c10::BFloat16> {
                                 const bool accum_c) {
     const int32_t k_times =
         dynamic_k_size / (AMX_TILE_ROW_NUM * 4 / sizeof(c10::BFloat16));
+
+    // Bandwidth-bound path: software prefetch next A/B tiles to overlap memory
+    // latency with AMX compute.
+    constexpr int32_t kPrefetchDist = 2;
+    constexpr int32_t kElemsPerAmxTile = AMX_TILE_BYTES / sizeof(c10::BFloat16);
+    constexpr int32_t kElemsPerAmxRow = AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
+    const int32_t a_step = [&]() {
+      if constexpr (phase == AttentionGemmPhase::QK) {
+        return kElemsPerAmxTile;
+      } else if constexpr (phase == AttentionGemmPhase::PV) {
+        return kElemsPerAmxRow;
+      } else {
+        TORCH_CHECK(false, "Unreachable");
+      }
+    }();
+    const int32_t b_step = kElemsPerAmxTile;
     c10::BFloat16* __restrict__ a_tile_0 = a_tile;
     c10::BFloat16* __restrict__ a_tile_1 = a_tile + lda * AMX_TILE_ROW_NUM;
     const int64_t a_tile_stride = [&]() {
@@ -107,6 +123,14 @@ class TileGemm224<c10::BFloat16> {
     }
 
     for (int32_t k = 0; k < k_times; ++k) {
+      const int32_t pf_k = k + kPrefetchDist;
+      if (pf_k < k_times) {
+        __builtin_prefetch(a_tile_0 + static_cast<int64_t>(kPrefetchDist) * a_step, 0, 1);
+        __builtin_prefetch(a_tile_1 + static_cast<int64_t>(kPrefetchDist) * a_step, 0, 1);
+        __builtin_prefetch(b_tile_2 + static_cast<int64_t>(kPrefetchDist) * b_step, 0, 0);
+        __builtin_prefetch(b_tile_3 + static_cast<int64_t>(kPrefetchDist) * b_step, 0, 0);
+      }
+
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_tile_stride);
       _tile_dpbf16ps(4, 0, 2);
@@ -117,19 +141,10 @@ class TileGemm224<c10::BFloat16> {
       _tile_dpbf16ps(7, 1, 3);
 
       // update ptrs
-      if constexpr (phase == AttentionGemmPhase::QK) {
-        // Q buffer is prepacked
-        a_tile_0 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      } else if constexpr (phase == AttentionGemmPhase::PV) {
-        // P buffer is not prepacked
-        a_tile_0 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-      } else {
-        TORCH_CHECK(false, "Unreachable");
-      }
-      b_tile_2 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_3 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
+      a_tile_0 += a_step;
+      a_tile_1 += a_step;
+      b_tile_2 += b_step;
+      b_tile_3 += b_step;
     }
 
     _tile_stored(4, c_tile_4, c_tile_stride);
@@ -239,6 +254,22 @@ class TileGemm122<c10::BFloat16> {
 
     const int32_t k_times =
         dynamic_k_size / (AMX_TILE_ROW_NUM * 4 / sizeof(c10::BFloat16));
+
+    // Bandwidth-bound path: software prefetch next A/B tiles to overlap memory
+    // latency with AMX compute.
+    constexpr int32_t kPrefetchDist = 2;
+    constexpr int32_t kElemsPerAmxTile = AMX_TILE_BYTES / sizeof(c10::BFloat16);
+    constexpr int32_t kElemsPerAmxRow = AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
+    const int32_t a_step = [&]() {
+      if constexpr (phase == AttentionGemmPhase::QK) {
+        return kElemsPerAmxTile;
+      } else if constexpr (phase == AttentionGemmPhase::PV) {
+        return kElemsPerAmxRow;
+      } else {
+        TORCH_CHECK(false, "Unreachable");
+      }
+    }();
+    const int32_t b_step = kElemsPerAmxTile;
     const int32_t k_group_times = k_times / 2;
     const bool has_tail = (k_times % 2 == 1);
 
@@ -251,6 +282,16 @@ class TileGemm122<c10::BFloat16> {
     }
 
     for (int32_t k = 0; k < k_group_times; ++k) {
+      const int32_t pf_k = k + kPrefetchDist;
+      if (pf_k < k_group_times) {
+        __builtin_prefetch(a_tile_0 + static_cast<int64_t>(kPrefetchDist) * a_step, 0, 1);
+        __builtin_prefetch(a_tile_1 + static_cast<int64_t>(kPrefetchDist) * a_step, 0, 1);
+        __builtin_prefetch(b_tile_2 + static_cast<int64_t>(kPrefetchDist) * b_step, 0, 0);
+        __builtin_prefetch(b_tile_3 + static_cast<int64_t>(kPrefetchDist) * b_step, 0, 0);
+        __builtin_prefetch(b_tile_4 + static_cast<int64_t>(kPrefetchDist) * b_step, 0, 0);
+        __builtin_prefetch(b_tile_5 + static_cast<int64_t>(kPrefetchDist) * b_step, 0, 0);
+      }
+
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_stride);
       _tile_dpbf16ps(6, 0, 2);
@@ -263,19 +304,12 @@ class TileGemm122<c10::BFloat16> {
       _tile_dpbf16ps(7, 1, 5);
 
       // update ptrs
-      if constexpr (phase == AttentionGemmPhase::QK) {
-        // Q buffer is prepacked
-        a_tile_0 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      } else if constexpr (phase == AttentionGemmPhase::PV) {
-        // P buffer is not prepacked
-        a_tile_0 += 2 * AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += 2 * AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-      }
-      b_tile_2 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_3 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_4 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_5 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
+      a_tile_0 += a_step;
+      a_tile_1 += a_step;
+      b_tile_2 += b_step;
+      b_tile_3 += b_step;
+      b_tile_4 += b_step;
+      b_tile_5 += b_step;
     }
 
     if (has_tail) {
