@@ -106,30 +106,56 @@ class TileGemm224<c10::BFloat16> {
       _tile_zero(7);
     }
 
-    for (int32_t k = 0; k < k_times; ++k) {
+    // Software-pipelined loop: overlap next iteration's tile loads with
+    // current iteration's dpbf16ps to hide load latency in compute-bound
+    // scenarios.
+    if (k_times > 0) {
+      // Prolog: load all tiles for the first iteration
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_tile_stride);
-      _tile_dpbf16ps(4, 0, 2);
-      _tile_stream_loadd(3, b_tile_3, b_tile_stride);
-      _tile_dpbf16ps(5, 0, 3);
       _tile_loadd(1, a_tile_1, a_tile_stride);
-      _tile_dpbf16ps(6, 1, 2);
-      _tile_dpbf16ps(7, 1, 3);
+      _tile_stream_loadd(3, b_tile_3, b_tile_stride);
 
-      // update ptrs
       if constexpr (phase == AttentionGemmPhase::QK) {
-        // Q buffer is prepacked
         a_tile_0 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
         a_tile_1 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
       } else if constexpr (phase == AttentionGemmPhase::PV) {
-        // P buffer is not prepacked
         a_tile_0 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
         a_tile_1 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-      } else {
-        TORCH_CHECK(false, "Unreachable");
       }
       b_tile_2 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
       b_tile_3 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
+
+      // Steady-state: compute current iteration while loading next
+      for (int32_t k = 1; k < k_times; ++k) {
+        _tile_dpbf16ps(4, 0, 2);
+        _tile_dpbf16ps(5, 0, 3);
+        // Tile 0 is free after the two dpbf16ps above; load next A0
+        _tile_loadd(0, a_tile_0, a_tile_stride);
+        _tile_dpbf16ps(6, 1, 2);
+        // Tile 2 is free after the dpbf16ps above; load next B2
+        _tile_stream_loadd(2, b_tile_2, b_tile_stride);
+        _tile_dpbf16ps(7, 1, 3);
+        // Tiles 1 and 3 are free after the dpbf16ps above; load next A1, B3
+        _tile_loadd(1, a_tile_1, a_tile_stride);
+        _tile_stream_loadd(3, b_tile_3, b_tile_stride);
+
+        if constexpr (phase == AttentionGemmPhase::QK) {
+          a_tile_0 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
+          a_tile_1 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
+        } else if constexpr (phase == AttentionGemmPhase::PV) {
+          a_tile_0 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
+          a_tile_1 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
+        }
+        b_tile_2 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
+        b_tile_3 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
+      }
+
+      // Epilog: compute last iteration (tiles already loaded)
+      _tile_dpbf16ps(4, 0, 2);
+      _tile_dpbf16ps(5, 0, 3);
+      _tile_dpbf16ps(6, 1, 2);
+      _tile_dpbf16ps(7, 1, 3);
     }
 
     _tile_stored(4, c_tile_4, c_tile_stride);
@@ -251,12 +277,14 @@ class TileGemm122<c10::BFloat16> {
     }
 
     for (int32_t k = 0; k < k_group_times; ++k) {
+      // First half: load A0 and both B tiles upfront, then compute
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_stride);
-      _tile_dpbf16ps(6, 0, 2);
-      _tile_stream_loadd(3, b_tile_3, b_stride);
-      _tile_dpbf16ps(7, 0, 3);
       _tile_loadd(1, a_tile_1, a_tile_stride);
+      _tile_stream_loadd(3, b_tile_3, b_stride);
+      _tile_dpbf16ps(6, 0, 2);
+      _tile_dpbf16ps(7, 0, 3);
+      // Second half: B tiles for second k-step already use separate tile regs
       _tile_stream_loadd(4, b_tile_4, b_stride);
       _tile_dpbf16ps(6, 1, 4);
       _tile_stream_loadd(5, b_tile_5, b_stride);
@@ -281,8 +309,8 @@ class TileGemm122<c10::BFloat16> {
     if (has_tail) {
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_stride);
-      _tile_dpbf16ps(6, 0, 2);
       _tile_stream_loadd(3, b_tile_3, b_stride);
+      _tile_dpbf16ps(6, 0, 2);
       _tile_dpbf16ps(7, 0, 3);
     }
 
