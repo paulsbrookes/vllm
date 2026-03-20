@@ -9,6 +9,47 @@ namespace {
 constexpr static int64_t AMX_TILE_ROW_BYTES = 64;
 constexpr static int64_t AMX_TILE_ROW_NUM = 16;
 constexpr static int64_t AMX_TILE_BYTES = AMX_TILE_ROW_BYTES * AMX_TILE_ROW_NUM;
+constexpr static int64_t AMX_TILE_CACHE_LINES = AMX_TILE_BYTES / 64;
+
+FORCE_INLINE static void prefetch_amx_tile_l2(const void* addr) {
+  const char* p = reinterpret_cast<const char*>(addr);
+  _mm_prefetch(p +  0 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  1 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  2 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  3 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  4 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  5 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  6 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  7 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  8 * 64, _MM_HINT_T1);
+  _mm_prefetch(p +  9 * 64, _MM_HINT_T1);
+  _mm_prefetch(p + 10 * 64, _MM_HINT_T1);
+  _mm_prefetch(p + 11 * 64, _MM_HINT_T1);
+  _mm_prefetch(p + 12 * 64, _MM_HINT_T1);
+  _mm_prefetch(p + 13 * 64, _MM_HINT_T1);
+  _mm_prefetch(p + 14 * 64, _MM_HINT_T1);
+  _mm_prefetch(p + 15 * 64, _MM_HINT_T1);
+}
+
+FORCE_INLINE static void prefetch_amx_tile_l1(const void* addr) {
+  const char* p = reinterpret_cast<const char*>(addr);
+  _mm_prefetch(p +  0 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  1 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  2 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  3 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  4 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  5 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  6 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  7 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  8 * 64, _MM_HINT_T0);
+  _mm_prefetch(p +  9 * 64, _MM_HINT_T0);
+  _mm_prefetch(p + 10 * 64, _MM_HINT_T0);
+  _mm_prefetch(p + 11 * 64, _MM_HINT_T0);
+  _mm_prefetch(p + 12 * 64, _MM_HINT_T0);
+  _mm_prefetch(p + 13 * 64, _MM_HINT_T0);
+  _mm_prefetch(p + 14 * 64, _MM_HINT_T0);
+  _mm_prefetch(p + 15 * 64, _MM_HINT_T0);
+}
 
 typedef struct __tile_config {
   uint8_t palette_id = 1;
@@ -106,11 +147,25 @@ class TileGemm224<c10::BFloat16> {
       _tile_zero(7);
     }
 
+    // Prefetch first B tiles into L2 before entering loop
+    if (k_times > 0) {
+      prefetch_amx_tile_l2(b_tile_2);
+      prefetch_amx_tile_l2(b_tile_3);
+    }
+
     for (int32_t k = 0; k < k_times; ++k) {
+      // Prefetch next iteration's B tiles while computing current
+      const auto* next_b2 = b_tile_2 + AMX_TILE_BYTES / sizeof(c10::BFloat16);
+      const auto* next_b3 = b_tile_3 + AMX_TILE_BYTES / sizeof(c10::BFloat16);
+
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_tile_stride);
+      // Overlap prefetch of next B tile with compute
+      prefetch_amx_tile_l2(next_b2);
       _tile_dpbf16ps(4, 0, 2);
       _tile_stream_loadd(3, b_tile_3, b_tile_stride);
+      // Overlap prefetch of next B tile with compute
+      prefetch_amx_tile_l2(next_b3);
       _tile_dpbf16ps(5, 0, 3);
       _tile_loadd(1, a_tile_1, a_tile_stride);
       _tile_dpbf16ps(6, 1, 2);
@@ -250,16 +305,36 @@ class TileGemm122<c10::BFloat16> {
       _tile_zero(7);
     }
 
+    // Prefetch first group's B tiles into L2 before entering loop
+    if (k_group_times > 0) {
+      prefetch_amx_tile_l2(b_tile_2);
+      prefetch_amx_tile_l2(b_tile_3);
+      prefetch_amx_tile_l2(b_tile_4);
+      prefetch_amx_tile_l2(b_tile_5);
+    }
+
     for (int32_t k = 0; k < k_group_times; ++k) {
+      // Prefetch next group's B tiles (2 tiles ahead for each B stream)
+      constexpr auto tile_step = 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
+      const auto* next_b2 = b_tile_2 + tile_step;
+      const auto* next_b3 = b_tile_3 + tile_step;
+      const auto* next_b4 = b_tile_4 + tile_step;
+      const auto* next_b5 = b_tile_5 + tile_step;
+
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_stride);
+      // Overlap prefetch with compute
+      prefetch_amx_tile_l2(next_b2);
       _tile_dpbf16ps(6, 0, 2);
       _tile_stream_loadd(3, b_tile_3, b_stride);
+      prefetch_amx_tile_l2(next_b3);
       _tile_dpbf16ps(7, 0, 3);
       _tile_loadd(1, a_tile_1, a_tile_stride);
       _tile_stream_loadd(4, b_tile_4, b_stride);
+      prefetch_amx_tile_l2(next_b4);
       _tile_dpbf16ps(6, 1, 4);
       _tile_stream_loadd(5, b_tile_5, b_stride);
+      prefetch_amx_tile_l2(next_b5);
       _tile_dpbf16ps(7, 1, 5);
 
       // update ptrs
@@ -279,6 +354,9 @@ class TileGemm122<c10::BFloat16> {
     }
 
     if (has_tail) {
+      // Prefetch tail B tiles
+      prefetch_amx_tile_l2(b_tile_2);
+      prefetch_amx_tile_l2(b_tile_3);
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, b_tile_2, b_stride);
       _tile_dpbf16ps(6, 0, 2);
@@ -461,7 +539,8 @@ class AttentionImpl<ISA::AMX, scalar_t, head_dim> {
 #pragma GCC unroll 8
           for (int64_t i = 0, j = 0; j < quadword_num;
                i += token_num_per_group, ++j) {
-            key_cache_start_ptr[i] = key_start_quadword_ptr[j];
+            // Use streaming store to avoid polluting cache for large KV caches
+            _mm_stream_si32(&key_cache_start_ptr[i], key_start_quadword_ptr[j]);
           }
         }
         {
