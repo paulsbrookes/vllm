@@ -54,8 +54,14 @@ class TileGemm224<c10::BFloat16> {
                                 const int32_t block_size,
                                 const int32_t dynamic_k_size,
                                 const bool accum_c) {
-    const int32_t k_times =
-        dynamic_k_size / (AMX_TILE_ROW_NUM * 4 / sizeof(c10::BFloat16));
+    constexpr int32_t k_elems_per_tile =
+        AMX_TILE_ROW_NUM * 4 / sizeof(c10::BFloat16);
+    constexpr bool has_static_k =
+        (phase == AttentionGemmPhase::QK) && (k_size > 0) &&
+        (k_size % k_elems_per_tile == 0);
+    constexpr int32_t static_k_times =
+        has_static_k ? (k_size / k_elems_per_tile) : 0;
+
     c10::BFloat16* __restrict__ a_tile_0 = a_tile;
     c10::BFloat16* __restrict__ a_tile_1 = a_tile + lda * AMX_TILE_ROW_NUM;
     const int64_t a_tile_stride = [&]() {
@@ -65,6 +71,17 @@ class TileGemm224<c10::BFloat16> {
       } else if constexpr (phase == AttentionGemmPhase::PV) {
         // logits_buffer is row-major
         return lda * sizeof(c10::BFloat16);
+      } else {
+        TORCH_CHECK(false, "Unreachable");
+      }
+    }();
+    const int64_t a_tile_advance = [&]() {
+      if constexpr (phase == AttentionGemmPhase::QK) {
+        // Q buffer is prepacked
+        return AMX_TILE_BYTES / sizeof(c10::BFloat16);
+      } else if constexpr (phase == AttentionGemmPhase::PV) {
+        // P buffer is not prepacked
+        return AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
       } else {
         TORCH_CHECK(false, "Unreachable");
       }
@@ -83,7 +100,8 @@ class TileGemm224<c10::BFloat16> {
       }
     }();
     // k_cache, v_cache are prepacked
-    const int32_t b_tile_stride = AMX_TILE_ROW_BYTES;
+    constexpr int64_t b_tile_stride = AMX_TILE_ROW_BYTES;
+    constexpr int64_t b_tile_advance = AMX_TILE_BYTES / sizeof(c10::BFloat16);
 
     // logits_buffer, output_buffer are not prepacked
     float* __restrict__ c_tile_4 = c_tile;
@@ -92,7 +110,7 @@ class TileGemm224<c10::BFloat16> {
     float* __restrict__ c_tile_6 = c_tile + AMX_TILE_ROW_NUM * ldc;
     float* __restrict__ c_tile_7 =
         c_tile_6 + AMX_TILE_ROW_BYTES / sizeof(float);
-    const int32_t c_tile_stride = ldc * sizeof(float);
+    const int64_t c_tile_stride = ldc * sizeof(float);
 
     if (accum_c) {
       _tile_loadd(4, c_tile_4, c_tile_stride);
@@ -106,30 +124,84 @@ class TileGemm224<c10::BFloat16> {
       _tile_zero(7);
     }
 
-    for (int32_t k = 0; k < k_times; ++k) {
-      _tile_loadd(0, a_tile_0, a_tile_stride);
-      _tile_stream_loadd(2, b_tile_2, b_tile_stride);
-      _tile_dpbf16ps(4, 0, 2);
-      _tile_stream_loadd(3, b_tile_3, b_tile_stride);
-      _tile_dpbf16ps(5, 0, 3);
-      _tile_loadd(1, a_tile_1, a_tile_stride);
-      _tile_dpbf16ps(6, 1, 2);
-      _tile_dpbf16ps(7, 1, 3);
+    if constexpr (has_static_k) {
+      if constexpr (static_k_times >= 2) {
+        vec_op::unroll_loop<int32_t, static_k_times / 2>([&](int32_t) {
+          _tile_loadd(0, a_tile_0, a_tile_stride);
+          _tile_stream_loadd(2, b_tile_2, b_tile_stride);
+          _tile_dpbf16ps(4, 0, 2);
+          _tile_stream_loadd(3, b_tile_3, b_tile_stride);
+          _tile_dpbf16ps(5, 0, 3);
+          _tile_loadd(1, a_tile_1, a_tile_stride);
+          _tile_dpbf16ps(6, 1, 2);
+          _tile_dpbf16ps(7, 1, 3);
 
-      // update ptrs
-      if constexpr (phase == AttentionGemmPhase::QK) {
-        // Q buffer is prepacked
-        a_tile_0 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      } else if constexpr (phase == AttentionGemmPhase::PV) {
-        // P buffer is not prepacked
-        a_tile_0 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-      } else {
-        TORCH_CHECK(false, "Unreachable");
+          _tile_loadd(0, a_tile_0 + a_tile_advance, a_tile_stride);
+          _tile_stream_loadd(2, b_tile_2 + b_tile_advance, b_tile_stride);
+          _tile_dpbf16ps(4, 0, 2);
+          _tile_stream_loadd(3, b_tile_3 + b_tile_advance, b_tile_stride);
+          _tile_dpbf16ps(5, 0, 3);
+          _tile_loadd(1, a_tile_1 + a_tile_advance, a_tile_stride);
+          _tile_dpbf16ps(6, 1, 2);
+          _tile_dpbf16ps(7, 1, 3);
+
+          a_tile_0 += 2 * a_tile_advance;
+          a_tile_1 += 2 * a_tile_advance;
+          b_tile_2 += 2 * b_tile_advance;
+          b_tile_3 += 2 * b_tile_advance;
+        });
       }
-      b_tile_2 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_3 += AMX_TILE_BYTES / sizeof(c10::BFloat16);
+
+      if constexpr ((static_k_times & 1) != 0) {
+        _tile_loadd(0, a_tile_0, a_tile_stride);
+        _tile_stream_loadd(2, b_tile_2, b_tile_stride);
+        _tile_dpbf16ps(4, 0, 2);
+        _tile_stream_loadd(3, b_tile_3, b_tile_stride);
+        _tile_dpbf16ps(5, 0, 3);
+        _tile_loadd(1, a_tile_1, a_tile_stride);
+        _tile_dpbf16ps(6, 1, 2);
+        _tile_dpbf16ps(7, 1, 3);
+      }
+    } else {
+      const int32_t k_times = dynamic_k_size / k_elems_per_tile;
+      const int32_t k_group_times = k_times / 2;
+      const bool has_tail = (k_times & 1) != 0;
+
+      for (int32_t k = 0; k < k_group_times; ++k) {
+        _tile_loadd(0, a_tile_0, a_tile_stride);
+        _tile_stream_loadd(2, b_tile_2, b_tile_stride);
+        _tile_dpbf16ps(4, 0, 2);
+        _tile_stream_loadd(3, b_tile_3, b_tile_stride);
+        _tile_dpbf16ps(5, 0, 3);
+        _tile_loadd(1, a_tile_1, a_tile_stride);
+        _tile_dpbf16ps(6, 1, 2);
+        _tile_dpbf16ps(7, 1, 3);
+
+        _tile_loadd(0, a_tile_0 + a_tile_advance, a_tile_stride);
+        _tile_stream_loadd(2, b_tile_2 + b_tile_advance, b_tile_stride);
+        _tile_dpbf16ps(4, 0, 2);
+        _tile_stream_loadd(3, b_tile_3 + b_tile_advance, b_tile_stride);
+        _tile_dpbf16ps(5, 0, 3);
+        _tile_loadd(1, a_tile_1 + a_tile_advance, a_tile_stride);
+        _tile_dpbf16ps(6, 1, 2);
+        _tile_dpbf16ps(7, 1, 3);
+
+        a_tile_0 += 2 * a_tile_advance;
+        a_tile_1 += 2 * a_tile_advance;
+        b_tile_2 += 2 * b_tile_advance;
+        b_tile_3 += 2 * b_tile_advance;
+      }
+
+      if (has_tail) {
+        _tile_loadd(0, a_tile_0, a_tile_stride);
+        _tile_stream_loadd(2, b_tile_2, b_tile_stride);
+        _tile_dpbf16ps(4, 0, 2);
+        _tile_stream_loadd(3, b_tile_3, b_tile_stride);
+        _tile_dpbf16ps(5, 0, 3);
+        _tile_loadd(1, a_tile_1, a_tile_stride);
+        _tile_dpbf16ps(6, 1, 2);
+        _tile_dpbf16ps(7, 1, 3);
+      }
     }
 
     _tile_stored(4, c_tile_4, c_tile_stride);
@@ -191,6 +263,14 @@ class TileGemm122<c10::BFloat16> {
                                 const int32_t block_size,
                                 const int32_t dynamic_k_size,
                                 const bool accum_c) {
+    constexpr int32_t k_elems_per_tile =
+        AMX_TILE_ROW_NUM * 4 / sizeof(c10::BFloat16);
+    constexpr bool has_static_k =
+        (phase == AttentionGemmPhase::QK) && (k_size > 0) &&
+        (k_size % k_elems_per_tile == 0);
+    constexpr int32_t static_k_times =
+        has_static_k ? (k_size / k_elems_per_tile) : 0;
+
     c10::BFloat16* __restrict__ a_tile_0 = a_tile;
     c10::BFloat16* __restrict__ a_tile_1 = [&]() {
       if constexpr (phase == AttentionGemmPhase::QK) {
@@ -214,6 +294,17 @@ class TileGemm122<c10::BFloat16> {
         TORCH_CHECK(false, "Unreachable");
       }
     }();
+    const int64_t a_tile_advance = [&]() {
+      if constexpr (phase == AttentionGemmPhase::QK) {
+        // Q buffer is prepacked
+        return AMX_TILE_BYTES / sizeof(c10::BFloat16);
+      } else if constexpr (phase == AttentionGemmPhase::PV) {
+        // P buffer is not prepacked
+        return AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
+      } else {
+        TORCH_CHECK(false, "Unreachable");
+      }
+    }();
 
     c10::BFloat16* __restrict__ b_tile_2 = b_tile;
     c10::BFloat16* __restrict__ b_tile_3 = [&]() {
@@ -231,16 +322,12 @@ class TileGemm122<c10::BFloat16> {
         b_tile_2 + AMX_TILE_BYTES / sizeof(c10::BFloat16);
     c10::BFloat16* __restrict__ b_tile_5 =
         b_tile_3 + AMX_TILE_BYTES / sizeof(c10::BFloat16);
-    int64_t b_stride = AMX_TILE_ROW_BYTES;
+    constexpr int64_t b_stride = AMX_TILE_ROW_BYTES;
+    constexpr int64_t b_tile_advance = AMX_TILE_BYTES / sizeof(c10::BFloat16);
 
     float* __restrict__ c_tile_6 = c_tile;
     float* __restrict__ c_tile_7 = c_tile + AMX_TILE_ROW_BYTES / sizeof(float);
-    int64_t c_stride = ldc * sizeof(float);
-
-    const int32_t k_times =
-        dynamic_k_size / (AMX_TILE_ROW_NUM * 4 / sizeof(c10::BFloat16));
-    const int32_t k_group_times = k_times / 2;
-    const bool has_tail = (k_times % 2 == 1);
+    const int64_t c_stride = ldc * sizeof(float);
 
     if (accum_c) {
       _tile_loadd(6, c_tile_6, c_stride);
@@ -250,40 +337,68 @@ class TileGemm122<c10::BFloat16> {
       _tile_zero(7);
     }
 
-    for (int32_t k = 0; k < k_group_times; ++k) {
-      _tile_loadd(0, a_tile_0, a_tile_stride);
-      _tile_stream_loadd(2, b_tile_2, b_stride);
-      _tile_dpbf16ps(6, 0, 2);
-      _tile_stream_loadd(3, b_tile_3, b_stride);
-      _tile_dpbf16ps(7, 0, 3);
-      _tile_loadd(1, a_tile_1, a_tile_stride);
-      _tile_stream_loadd(4, b_tile_4, b_stride);
-      _tile_dpbf16ps(6, 1, 4);
-      _tile_stream_loadd(5, b_tile_5, b_stride);
-      _tile_dpbf16ps(7, 1, 5);
+    if constexpr (has_static_k) {
+      if constexpr (static_k_times >= 2) {
+        vec_op::unroll_loop<int32_t, static_k_times / 2>([&](int32_t) {
+          _tile_loadd(0, a_tile_0, a_tile_stride);
+          _tile_stream_loadd(2, b_tile_2, b_stride);
+          _tile_dpbf16ps(6, 0, 2);
+          _tile_stream_loadd(3, b_tile_3, b_stride);
+          _tile_dpbf16ps(7, 0, 3);
+          _tile_loadd(1, a_tile_1, a_tile_stride);
+          _tile_stream_loadd(4, b_tile_4, b_stride);
+          _tile_dpbf16ps(6, 1, 4);
+          _tile_stream_loadd(5, b_tile_5, b_stride);
+          _tile_dpbf16ps(7, 1, 5);
 
-      // update ptrs
-      if constexpr (phase == AttentionGemmPhase::QK) {
-        // Q buffer is prepacked
-        a_tile_0 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      } else if constexpr (phase == AttentionGemmPhase::PV) {
-        // P buffer is not prepacked
-        a_tile_0 += 2 * AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
-        a_tile_1 += 2 * AMX_TILE_ROW_BYTES / sizeof(c10::BFloat16);
+          a_tile_0 += 2 * a_tile_advance;
+          a_tile_1 += 2 * a_tile_advance;
+          b_tile_2 += 2 * b_tile_advance;
+          b_tile_3 += 2 * b_tile_advance;
+          b_tile_4 += 2 * b_tile_advance;
+          b_tile_5 += 2 * b_tile_advance;
+        });
       }
-      b_tile_2 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_3 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_4 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-      b_tile_5 += 2 * AMX_TILE_BYTES / sizeof(c10::BFloat16);
-    }
 
-    if (has_tail) {
-      _tile_loadd(0, a_tile_0, a_tile_stride);
-      _tile_stream_loadd(2, b_tile_2, b_stride);
-      _tile_dpbf16ps(6, 0, 2);
-      _tile_stream_loadd(3, b_tile_3, b_stride);
-      _tile_dpbf16ps(7, 0, 3);
+      if constexpr ((static_k_times & 1) != 0) {
+        _tile_loadd(0, a_tile_0, a_tile_stride);
+        _tile_stream_loadd(2, b_tile_2, b_stride);
+        _tile_dpbf16ps(6, 0, 2);
+        _tile_stream_loadd(3, b_tile_3, b_stride);
+        _tile_dpbf16ps(7, 0, 3);
+      }
+    } else {
+      const int32_t k_times = dynamic_k_size / k_elems_per_tile;
+      const int32_t k_group_times = k_times / 2;
+      const bool has_tail = (k_times & 1) != 0;
+
+      for (int32_t k = 0; k < k_group_times; ++k) {
+        _tile_loadd(0, a_tile_0, a_tile_stride);
+        _tile_stream_loadd(2, b_tile_2, b_stride);
+        _tile_dpbf16ps(6, 0, 2);
+        _tile_stream_loadd(3, b_tile_3, b_stride);
+        _tile_dpbf16ps(7, 0, 3);
+        _tile_loadd(1, a_tile_1, a_tile_stride);
+        _tile_stream_loadd(4, b_tile_4, b_stride);
+        _tile_dpbf16ps(6, 1, 4);
+        _tile_stream_loadd(5, b_tile_5, b_stride);
+        _tile_dpbf16ps(7, 1, 5);
+
+        a_tile_0 += 2 * a_tile_advance;
+        a_tile_1 += 2 * a_tile_advance;
+        b_tile_2 += 2 * b_tile_advance;
+        b_tile_3 += 2 * b_tile_advance;
+        b_tile_4 += 2 * b_tile_advance;
+        b_tile_5 += 2 * b_tile_advance;
+      }
+
+      if (has_tail) {
+        _tile_loadd(0, a_tile_0, a_tile_stride);
+        _tile_stream_loadd(2, b_tile_2, b_stride);
+        _tile_dpbf16ps(6, 0, 2);
+        _tile_stream_loadd(3, b_tile_3, b_stride);
+        _tile_dpbf16ps(7, 0, 3);
+      }
     }
 
     _tile_stored(6, c_tile_6, c_stride);
