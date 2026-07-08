@@ -891,7 +891,7 @@ def sample_recovered_tokens_kernel(
     if pos >= num_draft_tokens:
         return
 
-    token_idx = start_idx + pos
+    token_idx = (start_idx + pos).to(tl.int64)
 
     if NO_DRAFT_PROBS:
         draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
@@ -927,7 +927,7 @@ def sample_recovered_tokens_kernel(
             # `tl.argmax` will select the maximum value.
 
         inv_q = tl.load(
-            inv_q_ptr + req_idx * vocab_size + vocab_offset,
+            inv_q_ptr + req_idx.to(tl.int64) * vocab_size + vocab_offset,
             mask=vocab_mask,
             other=0.0,
         )
