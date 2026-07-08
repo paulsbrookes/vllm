@@ -93,7 +93,7 @@ def _apply_grammar_bitmask_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     bitmask_idx = tl.program_id(0)
-    logits_idx = tl.load(logits_indices_ptr + bitmask_idx)
+    logits_idx = tl.load(logits_indices_ptr + bitmask_idx).to(tl.int64)
 
     # Load the bitmask.
     block_id = tl.program_id(1)
