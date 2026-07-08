@@ -813,17 +813,12 @@ def rejection_random_sample_kernel(
                 rate = tl.load(synthetic_conditional_rates_ptr + pos)
                 accepted = uniform_prob < rate
             else:
+                row_offset = (start_idx + pos).to(tl.int64) * vocab_size
                 if NO_DRAFT_PROBS:
                     draft_prob = 1
                 else:
-                    draft_prob = tl.load(
-                        draft_probs_ptr
-                        + (start_idx + pos) * vocab_size
-                        + draft_token_id
-                    )
-                target_prob = tl.load(
-                    target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
-                )
+                    draft_prob = tl.load(draft_probs_ptr + row_offset + draft_token_id)
+                target_prob = tl.load(target_probs_ptr + row_offset + draft_token_id)
                 # NOTE(woosuk): While the draft probability should never be 0,
                 # we check it to avoid NaNs. If it happens to be 0, we reject.
                 accepted = draft_prob > 0 and target_prob / draft_prob >= uniform_prob
