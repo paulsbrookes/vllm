@@ -273,6 +273,8 @@ def bmm_kernel(
     #   a_batch_ptr points to A[pid_b, 0, 0]
     #   b_batch_ptr points to B[pid_b, 0, 0]
     #   c_batch_ptr points to C[pid_b, 0, 0]
+    if A_LARGE or B_LARGE or C_LARGE:
+        pid_b = pid_b.to(tl.int64)
     a_batch_ptr = a_ptr + pid_b * stride_ab
     b_batch_ptr = b_ptr + pid_b * stride_bb
     c_batch_ptr = c_ptr + pid_b * stride_cb
