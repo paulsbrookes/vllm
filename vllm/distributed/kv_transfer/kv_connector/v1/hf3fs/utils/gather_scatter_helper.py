@@ -24,7 +24,7 @@ def kv_cache_scatter_kernel(
     if layer_idx >= num_layers or token_pos >= num_tokens_in_block:
         return
 
-    token_idx = tl.load(token_indices_ptr + token_pos)
+    token_idx = tl.load(token_indices_ptr + token_pos).to(tl.int64)
     kv_cache_ptr = tl.cast(tl.load(kv_cache_ptrs_ptr + layer_idx), source_ptr.dtype)
 
     if token_idx >= total_token_in_kvcache:
@@ -83,7 +83,7 @@ def kv_cache_gather_kernel(
     if layer_idx >= num_layers or token_pos >= num_tokens_in_block:
         return
 
-    token_idx = tl.load(token_indices_ptr + token_pos)
+    token_idx = tl.load(token_indices_ptr + token_pos).to(tl.int64)
     kv_cache_ptr = tl.cast(tl.load(kv_cache_ptrs_ptr + layer_idx), dst_ptr.dtype)
 
     if token_idx >= total_token_in_kvcache:
