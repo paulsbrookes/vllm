@@ -14,7 +14,7 @@ def _num_nans_kernel(
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
 ):
-    req_idx = tl.program_id(0)
+    req_idx = tl.program_id(0).to(tl.int64)
     num_nans = 0
     for i in range(0, vocab_size, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
