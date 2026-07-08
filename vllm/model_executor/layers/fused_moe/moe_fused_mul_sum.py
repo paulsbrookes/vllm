@@ -32,7 +32,7 @@ def moe_fused_mul_sum_kernel(
     k_mask = offs_k < size
     mask = m_mask[:, None] & k_mask[None, :]
 
-    a_base = inputs_ptr + (offs_m * stride_m)[:, None] + offs_k[None, :]
+    a_base = inputs_ptr + (offs_m.to(tl.int64) * stride_m)[:, None] + offs_k[None, :]
     b_base = topk_weights_ptr + offs_m * top_k
 
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
